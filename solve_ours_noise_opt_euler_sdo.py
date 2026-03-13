@@ -13,7 +13,6 @@ import torch
 from torchvision.utils import save_image
 from torchvision import transforms
 from util import set_seed, get_img_list, process_text
-# from sd3_sampler import get_solver
 from sd3_sampler_sdo import get_solver
 from torchvision.utils import make_grid
 from custom_util import *
@@ -23,114 +22,6 @@ import numpy as np
 import gc
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
-from debug_util import debug_save
-import mlflow
-
-
-class LowRankCayleyLatent(nn.Module):
-    """
-    x_T = R(U,V) @ z_0 를 학습 가능한 파라미터 U, V로 표현.
-
-    Args:
-        z_0:   초기 노이즈 텐서 (임의 shape). 내부적으로 flatten해서 관리.
-        rank:  Low-rank 파라미터 r. 총 2dr 파라미터. (권장: 32~64)
-        init_scale: U, V 초기화 스케일. 작을수록 R ≈ I (x_T ≈ z_0 에서 시작).
-    """
-
-    def __init__(
-        self,
-        z_0: torch.Tensor,
-        rank: int = 64,
-        init_scale: float = 0.01,
-    ):
-        super().__init__()
-
-        self.rank = rank
-        self.original_shape = z_0.shape
-        self.d = z_0.numel()
-
-        # z_0 고정: norm = sqrt(d) 로 정규화
-        z_flat = z_0.detach().flatten().float()
-        z_flat = z_flat / z_flat.norm() * math.sqrt(self.d)
-        self.register_buffer('z_0', z_flat)
-
-        # 학습 파라미터: U, V ∈ R^{d × r}
-        # init_scale 작게 → R ≈ I → 최적화 초기에 x_T ≈ z_0
-        self.U = nn.Parameter(torch.randn(self.d, rank) * init_scale)
-        self.V = nn.Parameter(torch.randn(self.d, rank) * init_scale)
-
-    # ── Woodbury 기반 Cayley matrix-vector product ──────────────
-
-    def _cayley_mv(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        R @ z 를 효율적으로 계산.
-
-        R = (I + A/2)^{-1}(I - A/2)
-        A/2 = P S P^T,  P = [U|V],  S = [[0,-I/2],[I/2,0]]
-
-        Step 1: w = (I - A/2) @ z = z - P S (P^T z)
-        Step 2: R @ z = (I + A/2)^{-1} @ w
-                      = w - P C^{-1} (P^T w)
-            C = S^{-1} + P^T P  (2r×2r, cheap to invert)
-        """
-        U, V = self.U, self.V
-        r = self.rank
-
-        # ── Step 1: w = (I - A/2) @ z ─────────────────────────
-        # P^T z = [U^T z; V^T z]
-        UTz = U.T @ z   # (r,)
-        VTz = V.T @ z   # (r,)
-
-        # S @ [UTz; VTz] = [-VTz/2; UTz/2]
-        # P @ (S @ P^T z) = U@(-VTz/2) + V@(UTz/2)
-        w = z - (U @ (-VTz / 2) + V @ (UTz / 2))   # (d,)
-
-        # ── Step 2: (I + A/2)^{-1} @ w ────────────────────────
-        # C = S^{-1} + P^T P
-        # S^{-1} = [[0, 2I], [-2I, 0]]
-        UTU = U.T @ U   # (r, r)
-        UTV = U.T @ V   # (r, r)
-        VTU = V.T @ U   # (r, r)
-        VTV = V.T @ V   # (r, r)
-
-        two_I = 2.0 * torch.eye(r, device=U.device, dtype=U.dtype)
-
-        # C = [[U^TU,       2I + U^TV ],
-        #      [-2I + V^TU, V^TV      ]]
-        C = torch.cat([
-            torch.cat([UTU,             two_I + UTV], dim=1),
-            torch.cat([-two_I + VTU,    VTV        ], dim=1),
-        ], dim=0)   # (2r, 2r)
-
-        # P^T w = [U^T w; V^T w]
-        PTw = torch.cat([U.T @ w, V.T @ w], dim=0)   # (2r,)
-
-        # C^{-1} @ P^T w
-        C_inv_PTw = torch.linalg.solve(C, PTw)        # (2r,)
-
-        # P @ (C^{-1} @ P^T w)
-        P_Cinv_PTw = U @ C_inv_PTw[:r] + V @ C_inv_PTw[r:]  # (d,)
-
-        return w - P_Cinv_PTw   # (d,)
-
-    # ── Public interface ────────────────────────────────────────
-
-    def get_x_T(self) -> torch.Tensor:
-        """x_T = R @ z_0, original shape으로 반환."""
-        x_T_flat = self._cayley_mv(self.z_0)
-        return x_T_flat.reshape(self.original_shape)
-
-    @torch.no_grad()
-    def norm_error(self) -> float:
-        """
-        Norm preservation 오차 확인용.
-        이상적으로는 0에 가까워야 함.
-        ||x_T|| - sqrt(d) ≈ 0 이면 Gaussian isotropy 유지 중.
-        """
-        norm = self.get_x_T().norm().item()
-        expected = math.sqrt(self.d)
-        return abs(norm - expected) / expected  # relative error
-
 
 @torch.no_grad
 def precompute(args, prompts:List[str], solver) -> List[torch.Tensor]:
@@ -144,35 +35,6 @@ def precompute(args, prompts:List[str], solver) -> List[torch.Tensor]:
     return prompt_emb_set, pooled_emb_set
 
 def run(args):
-    # ══════════════════════════════════════════════════════════════
-    # MLflow setup
-    # ══════════════════════════════════════════════════════════════
-    mlflow.set_experiment(args.task)
-    mlflow.start_run(run_name=args.workdir.name)
-    mlflow.log_params({
-        "seed": args.seed,
-        "NFE": args.NFE,
-        "inner_NFE": args.inner_NFE,
-        "cfg_scale": args.cfg_scale,
-        "img_size": args.img_size,
-        "task": args.task,
-        "operator_imp": args.operator_imp,
-        "deg_scale": args.deg_scale,
-        "noise_std": args.noise_std,
-        "n_experts": args.n_experts,
-        "n_reflections_per_expert": args.n_reflections_per_expert,
-        "noise_opt_steps": args.noise_opt_steps,
-        "lr_noise_opt": args.lr_noise_opt,
-        "lambda_jb": args.lambda_jb,
-        "lambda_ks": args.lambda_ks,
-        "lambda_orth": args.lambda_orth,
-        "phi": args.phi,
-        "eta_tilde": args.eta_tilde,
-        "use_amp": args.use_amp,
-        "use_grad_checkpoint": args.use_grad_checkpoint,
-        "workdir": str(args.workdir),
-    })
-
     # ══════════════════════════════════════════════════════════════
     # Load solver with gradient checkpointing
     # ══════════════════════════════════════════════════════════════
@@ -193,6 +55,12 @@ def run(args):
     print(f"  - Reflections per Expert: {args.n_reflections_per_expert}")
     print(f"  - Use Posterior Sampling: {args.use_posterior_sampling}")
     print(f"  - Optimization Sampler: EULER (not FireFlow)")
+    print(f"  - SDO (Shortcut Diffusion Optimization): {args.use_sdo}")
+    if args.use_sdo:
+        print(f"    -> Backprop retained only at step 0 (x_N shortcut, SDO paper Eq.15)")
+        print(f"    -> ~90%% memory/time reduction vs. full backprop expected")
+        if args.use_amp:
+            print(f"    -> Mixed precision (AMP) compatible with SDO: YES")
     print(f"{'='*60}\n")
 
     ###### suffix remove ############################
@@ -394,26 +262,39 @@ def run(args):
             use_scaling=True
         ).to(device)
 
-        # optimizer_noise = torch.optim.Adam([latent_noise], lr=args.lr_noise_opt)
+        optimizer_noise = torch.optim.Adam(hh_param.parameters(), lr=args.lr_noise_opt)
         
         # LR Warmup scheduler
         def lr_lambda(step):
-            # warmup_steps = 15
+            # warmup_steps = 15 if not args.use_sdo else 30  # SDO는 warmup 2배
             # if step < warmup_steps:
             #     return 0.1 + 0.9 * (step / warmup_steps)
             return 1.0
 
-        # scheduler = LambdaLR(optimizer_noise, lr_lambda)
+        scheduler = LambdaLR(optimizer_noise, lr_lambda)
 
         # ══════════════════════════════════════════════════════════════
         # Initialize GradScaler for Mixed Precision (if enabled)
         # ══════════════════════════════════════════════════════════════
         if args.use_amp:
-            scaler = GradScaler(
+
+            if args.use_sdo:
+                # SDO: gradient가 짧은 path로 전달되어 상대적으로 크고 안정적.
+                # init_scale을 낮춰서 초반 scale이 과도하게 크지 않도록 하고,
+                # growth_interval을 늘려 scale 변화를 느리게 유지.
+                scaler = GradScaler(
                     init_scale=2.**7,        # 128 (기존 1024에서 낮춤)
                     growth_factor=1.5,       # 보수적 증가 (기존 2.0)
                     backoff_factor=0.5,
                     growth_interval=200,     # 더 천천히 키움 (기존 100)
+                    enabled=True
+                )
+            else:
+                scaler = GradScaler(
+                    init_scale=2.**10,
+                    growth_factor=2.0,
+                    backoff_factor=0.5,
+                    growth_interval=100,
                     enabled=True
                 )
             print("✓ Mixed Precision (AMP) enabled")
@@ -438,7 +319,8 @@ def run(args):
         print(f"  inner_NFE={args.inner_NFE}  opt_steps={args.noise_opt_steps}")
         print(f"  n_experts={args.n_experts}  n_reflections_per_expert={args.n_reflections_per_expert}")
         print(f"  lr={args.lr_noise_opt}")
-        print(f"  Sampler: EULER (not FireFlow)")
+        sampler_tag = "EULER+SDO (shortcut backprop, step 0 only)" if args.use_sdo else "EULER (full backprop)"
+        print(f"  Sampler: {sampler_tag}")
         print(f"{'='*60}")
 
         sigma_for_dc = float(inner_sigmas[0])
@@ -448,16 +330,6 @@ def run(args):
         # ═══════════════════════════════════════════════════════════════
         z0t_progress_images = []          # Euler sampled images
         latent_noise_progress_images = []  # Direct latent noise decoded
-        # latent_noise = nn.Parameter(torch.randn(1, 16, 96, 96, device='cuda'))
-        # optimizer_noise = torch.optim.Adam([latent_noise], lr=args.lr_noise_opt)
-        # scheduler = LambdaLR(optimizer_noise, lr_lambda)
-        z_init = torch.randn(1, 16, 96, 96, device=device)
-        cayley_param = LowRankCayleyLatent(z_init, rank=64).to(device)
-        optimizer_noise = torch.optim.Adam(
-            cayley_param.parameters(),  # U, V
-            lr=args.lr_noise_opt
-        )
-        scheduler = LambdaLR(optimizer_noise, lr_lambda)
 
         for opt_iter in range(args.noise_opt_steps):
             optimizer_noise.zero_grad()
@@ -466,33 +338,33 @@ def run(args):
             # MIXTURE OF EXPERTS OPTIMIZATION (USING EULER)
             # ══════════════════════════════════════════════════════════
             if args.use_amp:
-                # (b) EULER and DC loss in mixed precision
-                latent_noise = cayley_param.get_x_T()
-
+                # (a) Generate latent noise (outside autocast)
+                latent_noise = hh_param()
+                
+                # (b) EULER (SDO or full-backprop) and DC loss in mixed precision
+                # SDO NOTE: When use_sdo=True, euler_sample_wo_process_SDO retains
+                # the computational graph only for step 0 (x_N → x_{N-1} transition),
+                # providing the gradient shortcut ∂x_{N-1}/∂x_N (SDO paper Eq. 15).
+                # All subsequent steps run under torch.no_grad(), cutting ~90% of
+                # memory and compute vs. full backprop. AMP is compatible here
+                # because GradScaler unscales gradients before the optimizer step.
                 with autocast(dtype=torch.float16):
-                    z0t_hat = solver.euler_sample_wo_process_SDO(
-                        initial_z=latent_noise,
-                        timesteps=inner_timesteps, sigmas=inner_sigmas,
-                        prompt_emb=p_emb, pooled_emb=p_pool,
-                        null_emb=n_emb, null_pooled=n_pool,
-                        cfg_scale=args.cfg_scale,
-                    )
-
-                    # z0t_hat_test1 = solver.euler_sample_wo_process(
-                    #     initial_z=z0_test,
-                    #     timesteps=inner_timesteps, sigmas=inner_sigmas,
-                    #     prompt_emb=p_emb, pooled_emb=p_pool,
-                    #     null_emb=n_emb, null_pooled=n_pool,
-                    #     cfg_scale=args.cfg_scale,
-                    # )
-
-                    # z0t_hat_test2 = solver.euler_sample_wo_process(
-                    #     initial_z=z0_test2,
-                    #     timesteps=inner_timesteps, sigmas=inner_sigmas,
-                    #     prompt_emb=p_emb, pooled_emb=p_pool,
-                    #     null_emb=n_emb, null_pooled=n_pool,
-                    #     cfg_scale=args.cfg_scale,
-                    # )
+                    if args.use_sdo:
+                        z0t_hat = solver.euler_sample_wo_process_SDO(
+                            initial_z=latent_noise,
+                            timesteps=inner_timesteps, sigmas=inner_sigmas,
+                            prompt_emb=p_emb, pooled_emb=p_pool,
+                            null_emb=n_emb, null_pooled=n_pool,
+                            cfg_scale=args.cfg_scale,
+                        )
+                    else:
+                        z0t_hat = solver.euler_sample_wo_process(
+                            initial_z=latent_noise,
+                            timesteps=inner_timesteps, sigmas=inner_sigmas,
+                            prompt_emb=p_emb, pooled_emb=p_pool,
+                            null_emb=n_emb, null_pooled=n_pool,
+                            cfg_scale=args.cfg_scale,
+                        )
 
                     loss_ir = solver.compute_data_consistency_loss(
                         z0t=z0t_hat, A=A_funcs, y=y,
@@ -504,17 +376,18 @@ def run(args):
 
                 # (c) Regularization losses in FP32
                 # MoHE regularization
-                # loss_mohe_reg = hh_param.get_regularization_loss(
-                #     lambda_orth=args.lambda_orth,
-                #     lambda_scale=args.lambda_scale_reg,
-                #     lambda_diversity=args.lambda_diversity
-                # )
+                loss_mohe_reg = hh_param.get_regularization_loss(
+                    lambda_orth=args.lambda_orth,
+                    lambda_scale=args.lambda_scale_reg,
+                    lambda_diversity=args.lambda_diversity
+                )
                 
                 # Gaussianity regularization
                 loss_jb_v = reg_jb(latent_noise)
                 loss_ks_v = reg_ks(latent_noise)
 
                 loss_total = (loss_ir
+                              + loss_mohe_reg
                               + args.lambda_jb * loss_jb_v
                               + args.lambda_ks * loss_ks_v)
 
@@ -526,7 +399,7 @@ def run(args):
                     scaler.unscale_(optimizer_noise)
                     
                     # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(cayley_param.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(hh_param.parameters(), max_norm=1.0)
                     
                     # Store scale before step
                     scale_before = scaler.get_scale()
@@ -534,11 +407,7 @@ def run(args):
                     scaler.step(optimizer_noise)
                     scaler.update()
                     scheduler.step()  # ← LR warmup
-
-                    # with torch.no_grad():
-                    #     cayley = LowRankCayleyLatent(latent_noise.data, rank=64).to(device)
-                    #     latent_noise.data = cayley.get_x_T()
-
+                    
                     # Check if step was skipped
                     scale_after = scaler.get_scale()
                     if opt_iter < 10 and scale_before != scale_after:
@@ -551,20 +420,40 @@ def run(args):
                 # Standard FP32 training
                 latent_noise = hh_param()
 
-                z0t_hat = solver.euler_sample_wo_process(
-                    initial_z=latent_noise,
-                    timesteps=inner_timesteps, sigmas=inner_sigmas,
-                    prompt_emb=p_emb, pooled_emb=p_pool,
-                    null_emb=n_emb, null_pooled=n_pool,
-                    cfg_scale=args.cfg_scale,
-                )
+                # SDO NOTE: When use_sdo=True, euler_sample_wo_process_SDO retains
+                # the computational graph only for step 0 (x_N → x_{N-1}),
+                # providing the gradient shortcut (SDO paper Eq. 15 / Fig. 4).
+                # When use_sdo=False, full backprop through all steps is used.
+                if args.use_sdo:
+                    z0t_hat = solver.euler_sample_wo_process_SDO(
+                        initial_z=latent_noise,
+                        timesteps=inner_timesteps, sigmas=inner_sigmas,
+                        prompt_emb=p_emb, pooled_emb=p_pool,
+                        null_emb=n_emb, null_pooled=n_pool,
+                        cfg_scale=args.cfg_scale,
+                    )
+                else:
+                    z0t_hat = solver.euler_sample_wo_process(
+                        initial_z=latent_noise,
+                        timesteps=inner_timesteps, sigmas=inner_sigmas,
+                        prompt_emb=p_emb, pooled_emb=p_pool,
+                        null_emb=n_emb, null_pooled=n_pool,
+                        cfg_scale=args.cfg_scale,
+                    )
 
-                loss_ir = solver.compute_data_consistency_loss_FAHG(
+                loss_ir = solver.compute_data_consistency_loss(
                     z0t=z0t_hat, A=A_funcs, y=y,
                     sigma_val=sigma_for_dc, noise_std=args.noise_std,
                     phi=args.phi, eta_tilde=args.eta_tilde,
                     # save_debug_images=True,
                     # debug_save_path="./debug_freq_images"
+                )
+
+                # MoHE regularization
+                loss_mohe_reg = hh_param.get_regularization_loss(
+                    lambda_orth=args.lambda_orth,
+                    lambda_scale=args.lambda_scale_reg,
+                    lambda_diversity=args.lambda_diversity
                 )
                 
                 # Gaussianity regularization
@@ -572,6 +461,7 @@ def run(args):
                 loss_ks_v = reg_ks(latent_noise)
 
                 loss_total = (loss_ir
+                              + loss_mohe_reg
                               + args.lambda_jb * loss_jb_v
                               + args.lambda_ks * loss_ks_v)
 
@@ -622,24 +512,16 @@ def run(args):
 
                 print(f"  [opt {opt_iter:4d}/{args.noise_opt_steps}]  "
                       f"total={loss_total.item():.4f}  ir={loss_ir.item():.4f}  "
-                      f"jb={loss_jb_v.item():.2e}  ks={loss_ks_v.item():.2e}  "
+                      f"mohe_reg={loss_mohe_reg.item():.2e}  jb={loss_jb_v.item():.2e}  ks={loss_ks_v.item():.2e}  "
                       f"JB:{jb_tag}(p={jb_pval:.4f})  KS:{ks_tag}(p={ks_pval:.4f})  "
                       f"Spatial:{spatial_tag}(corr={corr_max:.3f})  "
                       f"GPU:{allocated:.2f}/{reserved:.2f}GB")
-
-                global_step = i * args.noise_opt_steps + opt_iter
-                mlflow.log_metrics({
-                    "loss_total": loss_total.item(),
-                    "loss_ir": loss_ir.item(),
-                    "loss_jb": loss_jb_v.item(),
-                    "loss_ks": loss_ks_v.item(),
-                }, step=global_step)
-
+                
                 torch.cuda.empty_cache()
                 gc.collect()
 
             # Delete gradient tensors
-            del z0t_hat, loss_ir, loss_jb_v, loss_ks_v, loss_total
+            del z0t_hat, loss_ir, loss_mohe_reg, loss_jb_v, loss_ks_v, loss_total, latent_noise
 
         # ── Expert importance analysis ────────────────────────────────
         importance = hh_param.get_expert_importance()
@@ -684,8 +566,7 @@ def run(args):
         # Get optimized noise for final sampling
         # ══════════════════════════════════════════════════════════════
         with torch.no_grad():
-           #  optimized_noise = hh_param()
-           optimized_noise = latent_noise
+            optimized_noise = hh_param()
 
         # ══════════════════════════════════════════════════════════════
         # 4-1. Final Euler Sampling (Original method)
@@ -805,35 +686,19 @@ def run(args):
             save_image(recon_img_ps_01, args.workdir / 'recon_posterior' / f'{img_name}.png')
 
         # Save comparisons
-        comparison_path = args.workdir / 'recon_GT' / f'{img_name}_euler_comparison.png'
         save_comparison(
             y_vis_01, recon_img_euler_01, gt_img_01,
-            comparison_path,
+            args.workdir / 'recon_GT' / f'{img_name}_euler_comparison.png',
         )
-        print(f"  Saved: {comparison_path}")
-
+        print(f"  Saved: {args.workdir / 'recon_GT' / f'{img_name}_euler_comparison.png'}")
+        
         if args.use_posterior_sampling:
             # FIXED: All tensors now on same device (GPU)
-            ps_comparison_path = args.workdir / 'recon_GT' / f'{img_name}_posterior_comparison.png'
             save_comparison(
                 y_vis_01, recon_img_ps_01, gt_img_01,
-                ps_comparison_path,
+                args.workdir / 'recon_GT' / f'{img_name}_posterior_comparison.png',
             )
-            print(f"  Saved: {ps_comparison_path}")
-
-        # ── MLflow: log metrics and images ───────────────────────
-        mlflow.log_metrics({
-            f"{img_name}/psnr": metrics_euler['psnr'],
-            f"{img_name}/ssim": metrics_euler['ssim'],
-        }, step=i)
-        if args.use_posterior_sampling:
-            mlflow.log_metrics({
-                f"{img_name}/psnr_ps": metrics_ps['psnr'],
-                f"{img_name}/ssim_ps": metrics_ps['ssim'],
-            }, step=i)
-        mlflow.log_artifact(str(comparison_path), artifact_path=f"images/{img_name}")
-        mlflow.log_artifact(str(args.workdir / 'recon_euler' / f'{img_name}.png'), artifact_path=f"images/{img_name}")
-        mlflow.log_artifact(str(args.workdir / 'input1' / f'{img_name}.png'), artifact_path=f"images/{img_name}")
+            print(f"  Saved: {args.workdir / 'recon_GT' / f'{img_name}_posterior_comparison.png'}")
 
         print(f"{'='*60}\n")
 
@@ -847,8 +712,6 @@ def run(args):
             del scaler
         torch.cuda.empty_cache()
         gc.collect()
-
-    mlflow.end_run()
 
 
 if __name__ == "__main__":
@@ -882,6 +745,15 @@ if __name__ == "__main__":
                         help='Enable gradient checkpointing (saves 30-50%% memory, -20%% speed)')
     parser.add_argument('--use_amp', default=False, action='store_true',
                         help='Enable mixed precision training (saves 20-30%% memory, +30%% speed)')
+    parser.add_argument('--use_sdo', default=False, action='store_true',
+                        help=(
+                            'Enable Shortcut Diffusion Optimization (SDO). '
+                            'Retains the computational graph only for the first Euler step '
+                            '(x_N -> x_{N-1}) and runs all remaining steps under no_grad. '
+                            'Implements the one-step gradient shortcut of SDO paper (Eq. 15 / Fig. 4), '
+                            'reducing backprop memory and time by ~90%% vs. full backpropagation. '
+                            'Compatible with --use_amp.'
+                        ))
     
     # ══════════════════════════════════════════════════════════════
     # MIXTURE OF HOUSEHOLDER EXPERTS PARAMS
