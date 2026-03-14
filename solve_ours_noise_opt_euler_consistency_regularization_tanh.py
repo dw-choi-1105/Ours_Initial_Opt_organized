@@ -542,7 +542,8 @@ def run(args):
             # ══════════════════════════════════════════════════════════
             if args.use_amp:
                 # (b) EULER and DC loss in mixed precision
-                latent_noise = cayley_param.get_x_T()
+                latent_noise_raw = cayley_param.get_x_T()
+                latent_noise = 3.0 * torch.tanh(latent_noise_raw / 3.0)
 
                 with autocast(dtype=torch.float16):
                     z0t_hat = solver.euler_sample_wo_process_SDO(
@@ -775,8 +776,8 @@ def run(args):
         # Get optimized noise for final sampling
         # ══════════════════════════════════════════════════════════════
         with torch.no_grad():
-           #  optimized_noise = hh_param()
-           optimized_noise = latent_noise
+            optimized_noise_raw = cayley_param.get_x_T()
+            optimized_noise = 3.0 * torch.tanh(optimized_noise_raw / 3.0)
 
         # ══════════════════════════════════════════════════════════════
         # 4-1. Final Euler Sampling (Original method)
