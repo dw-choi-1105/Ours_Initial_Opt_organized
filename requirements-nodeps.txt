@@ -1,0 +1,6 @@
+# 의존성 충돌로 인해 --no-deps 옵션으로 설치해야 하는 패키지
+# 설치 방법: pip install --no-deps -r requirements-nodeps.txt
+#
+# flair==0.1.1: torch==0.4.0 을 요구하지만 실제로는 torch 2.x 와 호환됨.
+# 의존성 검사를 건너뛰고 설치해야 함.
+flair==0.1.1

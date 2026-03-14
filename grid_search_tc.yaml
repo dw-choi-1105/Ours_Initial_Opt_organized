@@ -1,0 +1,58 @@
+# Grid Search: lambda_tc_cons
+# 기준: tc raw loss ~0.03, ir loss ~500 → 의미있는 기여를 위해 10~1000 범위 탐색
+# baseline (lambda=0.0): PSNR=20.49, SSIM=0.7606 (euler.py 결과)
+# lambda=0.1: 사실상 비활성 (기여율 0.0006%)
+
+base_workdir_root: workdir_Ours_results_260311_test_euler/SR
+
+base_config:
+  img_path: ./data/FFHQ_5
+  img_size: 768
+  prompt: "a high quality photo of a face"
+  method: naive
+  task: deblur_motion
+  operator_imp: FFT
+  deg_scale: 61
+  noise_std: 0.03
+  cfg_scale: 1.0
+  seed: 42
+  NFE: 28
+  inner_NFE: 5
+  n_experts: 8
+  n_reflections_per_expert: 4
+  noise_opt_steps: 50
+  lr_noise_opt: 0.001
+  lambda_jb: 0
+  lambda_ks: 0
+  lambda_orth: 0
+  tc_num_samples: 2
+  tc_t_min: 0.1
+  tc_t_max: 0.9
+  use_grad_checkpoint: true
+  use_amp: true
+  efficient_memory: true
+
+experiments:
+  - name: FFHQ_tc_1
+    script: solve_ours_noise_opt_euler_consistency_regularization.py
+    task: grid_tc
+    overrides:
+      lambda_tc_cons: 1.0
+
+  - name: FFHQ_tc_10
+    script: solve_ours_noise_opt_euler_consistency_regularization.py
+    task: grid_tc
+    overrides:
+      lambda_tc_cons: 10.0
+
+  - name: FFHQ_tc_100
+    script: solve_ours_noise_opt_euler_consistency_regularization.py
+    task: grid_tc
+    overrides:
+      lambda_tc_cons: 100.0
+
+  - name: FFHQ_tc_1000
+    script: solve_ours_noise_opt_euler_consistency_regularization.py
+    task: grid_tc
+    overrides:
+      lambda_tc_cons: 1000.0

@@ -14,6 +14,7 @@ base_config:
   img_size: 768
   prompt: "a high quality photo of a face"
   method: naive
+  task: deblur_motion
   operator_imp: FFT
   deg_scale: 61
   noise_std: 0.03
