@@ -869,6 +869,7 @@ def run(args):
         print(f"\n  ──── Euler Results [{img_name}] ────")
         print(f"  PSNR : {metrics_euler['psnr']:.2f} dB")
         print(f"  SSIM : {metrics_euler['ssim']:.4f}")
+        print(f"  LPIPS: {metrics_euler['lpips']:.4f}")
         
         # Posterior sampling results (if enabled)
         if args.use_posterior_sampling:
@@ -916,11 +917,13 @@ def run(args):
         mlflow.log_metrics({
             f"{img_name}/psnr": metrics_euler['psnr'],
             f"{img_name}/ssim": metrics_euler['ssim'],
+            f"{img_name}/lpips": metrics_euler['lpips'],
         }, step=i)
         if args.use_posterior_sampling:
             mlflow.log_metrics({
                 f"{img_name}/psnr_ps": metrics_ps['psnr'],
                 f"{img_name}/ssim_ps": metrics_ps['ssim'],
+                f"{img_name}/lpips_ps": metrics_ps['lpips'],
             }, step=i)
         mlflow.log_artifact(str(comparison_path), artifact_path=f"images/{img_name}")
         mlflow.log_artifact(str(args.workdir / 'recon_euler' / f'{img_name}.png'), artifact_path=f"images/{img_name}")

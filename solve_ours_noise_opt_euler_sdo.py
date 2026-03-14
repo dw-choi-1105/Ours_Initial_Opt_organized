@@ -659,16 +659,18 @@ def run(args):
         print(f"\n  ──── Euler Results [{img_name}] ────")
         print(f"  PSNR : {metrics_euler['psnr']:.2f} dB")
         print(f"  SSIM : {metrics_euler['ssim']:.4f}")
-        
+        print(f"  LPIPS: {metrics_euler['lpips']:.4f}")
+
         # Posterior sampling results (if enabled)
         if args.use_posterior_sampling:
             # FIXED: Move to GPU for metrics and save_comparison
             recon_img_ps_01 = recon_img_ps_01.to(device)
-            
+
             metrics_ps = compute_psnr_ssim(recon_img_ps_01, gt_img_01)
             print(f"\n  ──── Posterior Sampling Results [{img_name}] ────")
             print(f"  PSNR : {metrics_ps['psnr']:.2f} dB")
             print(f"  SSIM : {metrics_ps['ssim']:.4f}")
+            print(f"  LPIPS: {metrics_ps['lpips']:.4f}")
 
         if args.task in ['sr_bicubic', 'inpainting', 'inpainting_DIV2K', 'cs_walshhadamard', 'cs_blockbased']: # modify
             y_vis = A_funcs.At(y).reshape(1, 3, args.img_size, args.img_size)

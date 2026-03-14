@@ -10,10 +10,11 @@ from typing import List
 from PIL import Image
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from torchvision.utils import save_image
 from torchvision import transforms
 from util import set_seed, get_img_list, process_text
-from sd3_sampler import get_solver
+from sd3_sampler_sdo import get_solver
 from torchvision.utils import make_grid
 from custom_util import *
 import matplotlib.pyplot as plt
@@ -22,7 +23,62 @@ import numpy as np
 import gc
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
-from debug_util import debug_save
+
+class TrajectoryConsistencyReg:
+    """
+    Trajectory Consistency Regularization for Rectified Flow noise optimization.
+
+    L_cons = E_{t~U[t_min, t_max]} [ || x̂_0(x_t, t) - sg[x̂_0(x_N, 1)] ||² ]
+
+    where:
+        x_t     = t * x_N + (1-t) * sg[x̂_0(x_N, 1)]   (straight path; grad flows via x_N)
+        x̂_0(x_t, t) = x_t - t * v_θ(x_t, t)            (1-step Euler prediction)
+
+    Args:
+        predict_velocity_fn: Callable(x_t: Tensor, t_sigma: float) → v_θ: Tensor
+            Must handle CFG internally. Operates in latent space.
+        num_samples:  number of t values sampled per call (each = 1 extra forward pass pair)
+        t_range:      (t_min, t_max) in sigma [0, 1] — avoids degenerate endpoints
+        stop_gradient_target: detach x̂_0(x_N, 1) as regression target (prevents collapse)
+    """
+
+    def __init__(
+        self,
+        predict_velocity_fn,
+        num_samples: int = 2,
+        t_range=(0.1, 0.9),
+        stop_gradient_target: bool = True,
+    ):
+        self.predict_velocity_fn = predict_velocity_fn
+        self.num_samples = num_samples
+        self.t_min, self.t_max = t_range
+        self.stop_gradient_target = stop_gradient_target
+
+    def __call__(self, x_N: torch.Tensor, x0_hat_endpoint: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_N:             latent noise (requires_grad=True), shape (B, C, H, W)
+            x0_hat_endpoint: predicted x_0 from inner_NFE Euler (z0t_hat), shape (B, C, H, W)
+        Returns:
+            Scalar consistency loss (unweighted).
+        """
+        target = x0_hat_endpoint.detach() if self.stop_gradient_target else x0_hat_endpoint
+        loss = torch.tensor(0.0, device=x_N.device, dtype=torch.float32)
+
+        for _ in range(self.num_samples):
+            t = self.t_min + (self.t_max - self.t_min) * torch.rand(1).item()
+
+            # Straight path: gradient flows through x_N
+            x_t = t * x_N + (1.0 - t) * target
+
+            # 1-step Euler prediction at intermediate point
+            v_t = self.predict_velocity_fn(x_t, t)
+            x0_hat_t = x_t - t * v_t
+
+            loss = loss + F.mse_loss(x0_hat_t.float(), target.float())
+
+        return loss / self.num_samples
+
 
 @torch.no_grad
 def precompute(args, prompts:List[str], solver) -> List[torch.Tensor]:
@@ -56,6 +112,12 @@ def run(args):
     print(f"  - Reflections per Expert: {args.n_reflections_per_expert}")
     print(f"  - Use Posterior Sampling: {args.use_posterior_sampling}")
     print(f"  - Optimization Sampler: EULER (not FireFlow)")
+    print(f"  - SDO (Shortcut Diffusion Optimization): {args.use_sdo}")
+    if args.use_sdo:
+        print(f"    -> Backprop retained only at step 0 (x_N shortcut, SDO paper Eq.15)")
+        print(f"    -> ~90%% memory/time reduction vs. full backprop expected")
+        if args.use_amp:
+            print(f"    -> Mixed precision (AMP) compatible with SDO: YES")
     print(f"{'='*60}\n")
 
     ###### suffix remove ############################
@@ -261,9 +323,9 @@ def run(args):
         
         # LR Warmup scheduler
         def lr_lambda(step):
-            warmup_steps = 15
-            if step < warmup_steps:
-                return 0.1 + 0.9 * (step / warmup_steps)
+            # warmup_steps = 15 if not args.use_sdo else 30  # SDO는 warmup 2배
+            # if step < warmup_steps:
+            #     return 0.1 + 0.9 * (step / warmup_steps)
             return 1.0
 
         scheduler = LambdaLR(optimizer_noise, lr_lambda)
@@ -272,13 +334,26 @@ def run(args):
         # Initialize GradScaler for Mixed Precision (if enabled)
         # ══════════════════════════════════════════════════════════════
         if args.use_amp:
-            scaler = GradScaler(
-                init_scale=2.**10,
-                growth_factor=2.0,
-                backoff_factor=0.5,
-                growth_interval=100,
-                enabled=True
-            )
+
+            if args.use_sdo:
+                # SDO: gradient가 짧은 path로 전달되어 상대적으로 크고 안정적.
+                # init_scale을 낮춰서 초반 scale이 과도하게 크지 않도록 하고,
+                # growth_interval을 늘려 scale 변화를 느리게 유지.
+                scaler = GradScaler(
+                    init_scale=2.**7,        # 128 (기존 1024에서 낮춤)
+                    growth_factor=1.5,       # 보수적 증가 (기존 2.0)
+                    backoff_factor=0.5,
+                    growth_interval=200,     # 더 천천히 키움 (기존 100)
+                    enabled=True
+                )
+            else:
+                scaler = GradScaler(
+                    init_scale=2.**10,
+                    growth_factor=2.0,
+                    backoff_factor=0.5,
+                    growth_interval=100,
+                    enabled=True
+                )
             print("✓ Mixed Precision (AMP) enabled")
             print("✓ Regularization losses computed in FP32 for numerical stability")
             print("✓ GradScaler initialized with init_scale=1024")
@@ -295,13 +370,32 @@ def run(args):
         p_emb, p_pool = prompt_embs[prompt_idx]
         n_emb, n_pool = null_embs
 
+        # ── Trajectory Consistency Regularization 설정 ──────────────
+        def _predict_velocity(x_t: torch.Tensor, t_sigma: float) -> torch.Tensor:
+            batch_size = x_t.shape[0]
+            ts = torch.empty(batch_size, device=x_t.device, dtype=inner_timesteps.dtype)
+            ts.fill_(t_sigma * solver.scheduler.config.num_train_timesteps)
+            pred_v = solver.predict_vector(x_t, ts, p_emb, p_pool)
+            if n_emb is not None:
+                pred_null_v = solver.predict_vector(x_t, ts, n_emb, n_pool)
+                pred_v = pred_null_v + args.cfg_scale * (pred_v - pred_null_v)
+            return pred_v
+
+        tc_reg = TrajectoryConsistencyReg(
+            predict_velocity_fn=_predict_velocity,
+            num_samples=args.tc_num_samples,
+            t_range=(args.tc_t_min, args.tc_t_max),
+            stop_gradient_target=True,
+        )
+
         # ── 3. OPTIMIZATION LOOP WITH MOHE ────────────────────────────
         print(f"\n{'='*60}")
         print(f"  Noise Optimization — Image [{img_name}]")
         print(f"  inner_NFE={args.inner_NFE}  opt_steps={args.noise_opt_steps}")
         print(f"  n_experts={args.n_experts}  n_reflections_per_expert={args.n_reflections_per_expert}")
         print(f"  lr={args.lr_noise_opt}")
-        print(f"  Sampler: EULER (not FireFlow)")
+        sampler_tag = "EULER+SDO (shortcut backprop, step 0 only)" if args.use_sdo else "EULER (full backprop)"
+        print(f"  Sampler: {sampler_tag}")
         print(f"{'='*60}")
 
         sigma_for_dc = float(inner_sigmas[0])
@@ -322,23 +416,44 @@ def run(args):
                 # (a) Generate latent noise (outside autocast)
                 latent_noise = hh_param()
                 
-                # (b) EULER and DC loss in mixed precision
+                # (b) EULER (SDO or full-backprop) and DC loss in mixed precision
+                # SDO NOTE: When use_sdo=True, euler_sample_wo_process_SDO retains
+                # the computational graph only for step 0 (x_N → x_{N-1} transition),
+                # providing the gradient shortcut ∂x_{N-1}/∂x_N (SDO paper Eq. 15).
+                # All subsequent steps run under torch.no_grad(), cutting ~90% of
+                # memory and compute vs. full backprop. AMP is compatible here
+                # because GradScaler unscales gradients before the optimizer step.
                 with autocast(dtype=torch.float16):
-                    z0t_hat = solver.euler_sample_wo_process(
-                        initial_z=latent_noise,
-                        timesteps=inner_timesteps, sigmas=inner_sigmas,
-                        prompt_emb=p_emb, pooled_emb=p_pool,
-                        null_emb=n_emb, null_pooled=n_pool,
-                        cfg_scale=args.cfg_scale,
-                    )
+                    if args.use_sdo:
+                        z0t_hat = solver.euler_sample_wo_process_SDO(
+                            initial_z=latent_noise,
+                            timesteps=inner_timesteps, sigmas=inner_sigmas,
+                            prompt_emb=p_emb, pooled_emb=p_pool,
+                            null_emb=n_emb, null_pooled=n_pool,
+                            cfg_scale=args.cfg_scale,
+                        )
+                    else:
+                        z0t_hat = solver.euler_sample_wo_process(
+                            initial_z=latent_noise,
+                            timesteps=inner_timesteps, sigmas=inner_sigmas,
+                            prompt_emb=p_emb, pooled_emb=p_pool,
+                            null_emb=n_emb, null_pooled=n_pool,
+                            cfg_scale=args.cfg_scale,
+                        )
 
-                    loss_ir = solver.compute_data_consistency_loss_FAHG(
+                    loss_ir = solver.compute_data_consistency_loss(
                         z0t=z0t_hat, A=A_funcs, y=y,
                         sigma_val=sigma_for_dc, noise_std=args.noise_std,
                         phi=args.phi, eta_tilde=args.eta_tilde,
                         # save_debug_images=True,
                         # debug_save_path="./debug_freq_images"
                     )
+
+                    # TC Consistency Regularization (inside autocast for FP16 transformer)
+                    if args.lambda_tc_cons > 0.0:
+                        loss_tc_v = tc_reg(latent_noise, z0t_hat)
+                    else:
+                        loss_tc_v = torch.tensor(0.0, device=latent_noise.device)
 
                 # (c) Regularization losses in FP32
                 # MoHE regularization
@@ -355,7 +470,8 @@ def run(args):
                 loss_total = (loss_ir
                               + loss_mohe_reg
                               + args.lambda_jb * loss_jb_v
-                              + args.lambda_ks * loss_ks_v)
+                              + args.lambda_ks * loss_ks_v
+                              + args.lambda_tc_cons * loss_tc_v)
 
                 # Check for inf/nan before backward
                 if torch.isfinite(loss_total):
@@ -386,21 +502,40 @@ def run(args):
                 # Standard FP32 training
                 latent_noise = hh_param()
 
-                z0t_hat = solver.euler_sample_wo_process(
-                    initial_z=latent_noise,
-                    timesteps=inner_timesteps, sigmas=inner_sigmas,
-                    prompt_emb=p_emb, pooled_emb=p_pool,
-                    null_emb=n_emb, null_pooled=n_pool,
-                    cfg_scale=args.cfg_scale,
-                )
+                # SDO NOTE: When use_sdo=True, euler_sample_wo_process_SDO retains
+                # the computational graph only for step 0 (x_N → x_{N-1}),
+                # providing the gradient shortcut (SDO paper Eq. 15 / Fig. 4).
+                # When use_sdo=False, full backprop through all steps is used.
+                if args.use_sdo:
+                    z0t_hat = solver.euler_sample_wo_process_SDO(
+                        initial_z=latent_noise,
+                        timesteps=inner_timesteps, sigmas=inner_sigmas,
+                        prompt_emb=p_emb, pooled_emb=p_pool,
+                        null_emb=n_emb, null_pooled=n_pool,
+                        cfg_scale=args.cfg_scale,
+                    )
+                else:
+                    z0t_hat = solver.euler_sample_wo_process(
+                        initial_z=latent_noise,
+                        timesteps=inner_timesteps, sigmas=inner_sigmas,
+                        prompt_emb=p_emb, pooled_emb=p_pool,
+                        null_emb=n_emb, null_pooled=n_pool,
+                        cfg_scale=args.cfg_scale,
+                    )
 
-                loss_ir = solver.compute_data_consistency_loss_FAHG(
+                loss_ir = solver.compute_data_consistency_loss(
                     z0t=z0t_hat, A=A_funcs, y=y,
                     sigma_val=sigma_for_dc, noise_std=args.noise_std,
                     phi=args.phi, eta_tilde=args.eta_tilde,
                     # save_debug_images=True,
                     # debug_save_path="./debug_freq_images"
                 )
+
+                # TC Consistency Regularization
+                if args.lambda_tc_cons > 0.0:
+                    loss_tc_v = tc_reg(latent_noise, z0t_hat)
+                else:
+                    loss_tc_v = torch.tensor(0.0, device=latent_noise.device)
 
                 # MoHE regularization
                 loss_mohe_reg = hh_param.get_regularization_loss(
@@ -416,7 +551,8 @@ def run(args):
                 loss_total = (loss_ir
                               + loss_mohe_reg
                               + args.lambda_jb * loss_jb_v
-                              + args.lambda_ks * loss_ks_v)
+                              + args.lambda_ks * loss_ks_v
+                              + args.lambda_tc_cons * loss_tc_v)
 
                 loss_total.backward()
 
@@ -465,6 +601,7 @@ def run(args):
 
                 print(f"  [opt {opt_iter:4d}/{args.noise_opt_steps}]  "
                       f"total={loss_total.item():.4f}  ir={loss_ir.item():.4f}  "
+                      f"tc={loss_tc_v.item():.2e}  "
                       f"mohe_reg={loss_mohe_reg.item():.2e}  jb={loss_jb_v.item():.2e}  ks={loss_ks_v.item():.2e}  "
                       f"JB:{jb_tag}(p={jb_pval:.4f})  KS:{ks_tag}(p={ks_pval:.4f})  "
                       f"Spatial:{spatial_tag}(corr={corr_max:.3f})  "
@@ -474,7 +611,7 @@ def run(args):
                 gc.collect()
 
             # Delete gradient tensors
-            del z0t_hat, loss_ir, loss_mohe_reg, loss_jb_v, loss_ks_v, loss_total, latent_noise
+            del z0t_hat, loss_ir, loss_tc_v, loss_mohe_reg, loss_jb_v, loss_ks_v, loss_total, latent_noise
 
         # ── Expert importance analysis ────────────────────────────────
         importance = hh_param.get_expert_importance()
@@ -613,17 +750,16 @@ def run(args):
         print(f"  PSNR : {metrics_euler['psnr']:.2f} dB")
         print(f"  SSIM : {metrics_euler['ssim']:.4f}")
         print(f"  LPIPS: {metrics_euler['lpips']:.4f}")
-
+        
         # Posterior sampling results (if enabled)
         if args.use_posterior_sampling:
             # FIXED: Move to GPU for metrics and save_comparison
             recon_img_ps_01 = recon_img_ps_01.to(device)
-
+            
             metrics_ps = compute_psnr_ssim(recon_img_ps_01, gt_img_01)
             print(f"\n  ──── Posterior Sampling Results [{img_name}] ────")
             print(f"  PSNR : {metrics_ps['psnr']:.2f} dB")
             print(f"  SSIM : {metrics_ps['ssim']:.4f}")
-            print(f"  LPIPS: {metrics_ps['lpips']:.4f}")
 
         if args.task in ['sr_bicubic', 'inpainting', 'inpainting_DIV2K', 'cs_walshhadamard', 'cs_blockbased']: # modify
             y_vis = A_funcs.At(y).reshape(1, 3, args.img_size, args.img_size)
@@ -700,6 +836,15 @@ if __name__ == "__main__":
                         help='Enable gradient checkpointing (saves 30-50%% memory, -20%% speed)')
     parser.add_argument('--use_amp', default=False, action='store_true',
                         help='Enable mixed precision training (saves 20-30%% memory, +30%% speed)')
+    parser.add_argument('--use_sdo', default=False, action='store_true',
+                        help=(
+                            'Enable Shortcut Diffusion Optimization (SDO). '
+                            'Retains the computational graph only for the first Euler step '
+                            '(x_N -> x_{N-1}) and runs all remaining steps under no_grad. '
+                            'Implements the one-step gradient shortcut of SDO paper (Eq. 15 / Fig. 4), '
+                            'reducing backprop memory and time by ~90%% vs. full backpropagation. '
+                            'Compatible with --use_amp.'
+                        ))
     
     # ══════════════════════════════════════════════════════════════
     # MIXTURE OF HOUSEHOLDER EXPERTS PARAMS
@@ -757,6 +902,16 @@ if __name__ == "__main__":
                         help='Function for data consistency schedule in posterior sampling')
     
     parser.add_argument('--prompt_suffix_to_remove', type=str, default=', high-resolution, 8k')
+
+    # Trajectory Consistency Regularization params
+    parser.add_argument('--lambda_tc_cons', type=float, default=0.0,
+                        help='Weight for trajectory consistency regularization (0 = disabled)')
+    parser.add_argument('--tc_num_samples', type=int, default=2,
+                        help='Number of t samples per optimization step for TC reg')
+    parser.add_argument('--tc_t_min', type=float, default=0.1,
+                        help='Minimum t (sigma) for TC regularization sampling')
+    parser.add_argument('--tc_t_max', type=float, default=0.9,
+                        help='Maximum t (sigma) for TC regularization sampling')
 
     args = parser.parse_args()
 

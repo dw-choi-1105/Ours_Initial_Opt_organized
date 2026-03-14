@@ -10,10 +10,12 @@ from typing import List
 from PIL import Image
 from tqdm import tqdm
 import torch
+import torch.nn.functional as F
 from torchvision.utils import save_image
 from torchvision import transforms
 from util import set_seed, get_img_list, process_text
-from sd3_sampler import get_solver
+# from sd3_sampler import get_solver
+from sd3_sampler_sdo import get_solver
 from torchvision.utils import make_grid
 from custom_util import *
 import matplotlib.pyplot as plt
@@ -23,6 +25,169 @@ import gc
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 from debug_util import debug_save
+import mlflow
+
+
+class LowRankCayleyLatent(nn.Module):
+    """
+    x_T = R(U,V) @ z_0 를 학습 가능한 파라미터 U, V로 표현.
+
+    Args:
+        z_0:   초기 노이즈 텐서 (임의 shape). 내부적으로 flatten해서 관리.
+        rank:  Low-rank 파라미터 r. 총 2dr 파라미터. (권장: 32~64)
+        init_scale: U, V 초기화 스케일. 작을수록 R ≈ I (x_T ≈ z_0 에서 시작).
+    """
+
+    def __init__(
+        self,
+        z_0: torch.Tensor,
+        rank: int = 64,
+        init_scale: float = 0.01,
+    ):
+        super().__init__()
+
+        self.rank = rank
+        self.original_shape = z_0.shape
+        self.d = z_0.numel()
+
+        # z_0 고정: norm = sqrt(d) 로 정규화
+        z_flat = z_0.detach().flatten().float()
+        z_flat = z_flat / z_flat.norm() * math.sqrt(self.d)
+        self.register_buffer('z_0', z_flat)
+
+        # 학습 파라미터: U, V ∈ R^{d × r}
+        # init_scale 작게 → R ≈ I → 최적화 초기에 x_T ≈ z_0
+        self.U = nn.Parameter(torch.randn(self.d, rank) * init_scale)
+        self.V = nn.Parameter(torch.randn(self.d, rank) * init_scale)
+
+    # ── Woodbury 기반 Cayley matrix-vector product ──────────────
+
+    def _cayley_mv(self, z: torch.Tensor) -> torch.Tensor:
+        """
+        R @ z 를 효율적으로 계산.
+
+        R = (I + A/2)^{-1}(I - A/2)
+        A/2 = P S P^T,  P = [U|V],  S = [[0,-I/2],[I/2,0]]
+
+        Step 1: w = (I - A/2) @ z = z - P S (P^T z)
+        Step 2: R @ z = (I + A/2)^{-1} @ w
+                      = w - P C^{-1} (P^T w)
+            C = S^{-1} + P^T P  (2r×2r, cheap to invert)
+        """
+        U, V = self.U, self.V
+        r = self.rank
+
+        # ── Step 1: w = (I - A/2) @ z ─────────────────────────
+        # P^T z = [U^T z; V^T z]
+        UTz = U.T @ z   # (r,)
+        VTz = V.T @ z   # (r,)
+
+        # S @ [UTz; VTz] = [-VTz/2; UTz/2]
+        # P @ (S @ P^T z) = U@(-VTz/2) + V@(UTz/2)
+        w = z - (U @ (-VTz / 2) + V @ (UTz / 2))   # (d,)
+
+        # ── Step 2: (I + A/2)^{-1} @ w ────────────────────────
+        # C = S^{-1} + P^T P
+        # S^{-1} = [[0, 2I], [-2I, 0]]
+        UTU = U.T @ U   # (r, r)
+        UTV = U.T @ V   # (r, r)
+        VTU = V.T @ U   # (r, r)
+        VTV = V.T @ V   # (r, r)
+
+        two_I = 2.0 * torch.eye(r, device=U.device, dtype=U.dtype)
+
+        # C = [[U^TU,       2I + U^TV ],
+        #      [-2I + V^TU, V^TV      ]]
+        C = torch.cat([
+            torch.cat([UTU,             two_I + UTV], dim=1),
+            torch.cat([-two_I + VTU,    VTV        ], dim=1),
+        ], dim=0)   # (2r, 2r)
+
+        # P^T w = [U^T w; V^T w]
+        PTw = torch.cat([U.T @ w, V.T @ w], dim=0)   # (2r,)
+
+        # C^{-1} @ P^T w
+        C_inv_PTw = torch.linalg.solve(C, PTw)        # (2r,)
+
+        # P @ (C^{-1} @ P^T w)
+        P_Cinv_PTw = U @ C_inv_PTw[:r] + V @ C_inv_PTw[r:]  # (d,)
+
+        return w - P_Cinv_PTw   # (d,)
+
+    # ── Public interface ────────────────────────────────────────
+
+    def get_x_T(self) -> torch.Tensor:
+        """x_T = R @ z_0, original shape으로 반환."""
+        x_T_flat = self._cayley_mv(self.z_0)
+        return x_T_flat.reshape(self.original_shape)
+
+    @torch.no_grad()
+    def norm_error(self) -> float:
+        """
+        Norm preservation 오차 확인용.
+        이상적으로는 0에 가까워야 함.
+        ||x_T|| - sqrt(d) ≈ 0 이면 Gaussian isotropy 유지 중.
+        """
+        norm = self.get_x_T().norm().item()
+        expected = math.sqrt(self.d)
+        return abs(norm - expected) / expected  # relative error
+
+
+class TrajectoryConsistencyReg:
+    """
+    Trajectory Consistency Regularization for Rectified Flow noise optimization.
+
+    L_cons = E_{t~U[t_min, t_max]} [ || x̂_0(x_t, t) - sg[x̂_0(x_N, 1)] ||² ]
+
+    where:
+        x_t     = t * x_N + (1-t) * sg[x̂_0(x_N, 1)]   (straight path; grad flows via x_N)
+        x̂_0(x_t, t) = x_t - t * v_θ(x_t, t)            (1-step Euler prediction)
+
+    Args:
+        predict_velocity_fn: Callable(x_t: Tensor, t_sigma: float) → v_θ: Tensor
+            Must handle CFG internally. Operates in latent space.
+        num_samples:  number of t values sampled per call (each = 1 extra forward pass pair)
+        t_range:      (t_min, t_max) in sigma [0, 1] — avoids degenerate endpoints
+        stop_gradient_target: detach x̂_0(x_N, 1) as regression target (prevents collapse)
+    """
+
+    def __init__(
+        self,
+        predict_velocity_fn,
+        num_samples: int = 2,
+        t_range=(0.1, 0.9),
+        stop_gradient_target: bool = True,
+    ):
+        self.predict_velocity_fn = predict_velocity_fn
+        self.num_samples = num_samples
+        self.t_min, self.t_max = t_range
+        self.stop_gradient_target = stop_gradient_target
+
+    def __call__(self, x_N: torch.Tensor, x0_hat_endpoint: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x_N:             latent noise (requires_grad=True), shape (B, C, H, W)
+            x0_hat_endpoint: predicted x_0 from inner_NFE Euler (z0t_hat), shape (B, C, H, W)
+        Returns:
+            Scalar consistency loss (unweighted).
+        """
+        target = x0_hat_endpoint.detach() if self.stop_gradient_target else x0_hat_endpoint
+        loss = torch.tensor(0.0, device=x_N.device, dtype=torch.float32)
+
+        for _ in range(self.num_samples):
+            t = self.t_min + (self.t_max - self.t_min) * torch.rand(1).item()
+
+            # Straight path: gradient flows through x_N
+            x_t = t * x_N + (1.0 - t) * target
+
+            # 1-step Euler prediction at intermediate point
+            v_t = self.predict_velocity_fn(x_t, t)
+            x0_hat_t = x_t - t * v_t
+
+            loss = loss + F.mse_loss(x0_hat_t.float(), target.float())
+
+        return loss / self.num_samples
+
 
 @torch.no_grad
 def precompute(args, prompts:List[str], solver) -> List[torch.Tensor]:
@@ -36,6 +201,35 @@ def precompute(args, prompts:List[str], solver) -> List[torch.Tensor]:
     return prompt_emb_set, pooled_emb_set
 
 def run(args):
+    # ══════════════════════════════════════════════════════════════
+    # MLflow setup
+    # ══════════════════════════════════════════════════════════════
+    mlflow.set_experiment(args.task)
+    mlflow.start_run(run_name=args.workdir.name)
+    mlflow.log_params({
+        "seed": args.seed,
+        "NFE": args.NFE,
+        "inner_NFE": args.inner_NFE,
+        "cfg_scale": args.cfg_scale,
+        "img_size": args.img_size,
+        "task": args.task,
+        "operator_imp": args.operator_imp,
+        "deg_scale": args.deg_scale,
+        "noise_std": args.noise_std,
+        "n_experts": args.n_experts,
+        "n_reflections_per_expert": args.n_reflections_per_expert,
+        "noise_opt_steps": args.noise_opt_steps,
+        "lr_noise_opt": args.lr_noise_opt,
+        "lambda_jb": args.lambda_jb,
+        "lambda_ks": args.lambda_ks,
+        "lambda_orth": args.lambda_orth,
+        "phi": args.phi,
+        "eta_tilde": args.eta_tilde,
+        "use_amp": args.use_amp,
+        "use_grad_checkpoint": args.use_grad_checkpoint,
+        "workdir": str(args.workdir),
+    })
+
     # ══════════════════════════════════════════════════════════════
     # Load solver with gradient checkpointing
     # ══════════════════════════════════════════════════════════════
@@ -257,28 +451,28 @@ def run(args):
             use_scaling=True
         ).to(device)
 
-        optimizer_noise = torch.optim.Adam(hh_param.parameters(), lr=args.lr_noise_opt)
+        # optimizer_noise = torch.optim.Adam([latent_noise], lr=args.lr_noise_opt)
         
         # LR Warmup scheduler
         def lr_lambda(step):
-            warmup_steps = 15
-            if step < warmup_steps:
-                return 0.1 + 0.9 * (step / warmup_steps)
+            # warmup_steps = 15
+            # if step < warmup_steps:
+            #     return 0.1 + 0.9 * (step / warmup_steps)
             return 1.0
 
-        scheduler = LambdaLR(optimizer_noise, lr_lambda)
+        # scheduler = LambdaLR(optimizer_noise, lr_lambda)
 
         # ══════════════════════════════════════════════════════════════
         # Initialize GradScaler for Mixed Precision (if enabled)
         # ══════════════════════════════════════════════════════════════
         if args.use_amp:
             scaler = GradScaler(
-                init_scale=2.**10,
-                growth_factor=2.0,
-                backoff_factor=0.5,
-                growth_interval=100,
-                enabled=True
-            )
+                    init_scale=2.**7,        # 128 (기존 1024에서 낮춤)
+                    growth_factor=1.5,       # 보수적 증가 (기존 2.0)
+                    backoff_factor=0.5,
+                    growth_interval=200,     # 더 천천히 키움 (기존 100)
+                    enabled=True
+                )
             print("✓ Mixed Precision (AMP) enabled")
             print("✓ Regularization losses computed in FP32 for numerical stability")
             print("✓ GradScaler initialized with init_scale=1024")
@@ -294,6 +488,24 @@ def run(args):
         # Prompt / null embeddings
         p_emb, p_pool = prompt_embs[prompt_idx]
         n_emb, n_pool = null_embs
+
+        # ── Trajectory Consistency Regularization 설정 ──────────────
+        def _predict_velocity(x_t: torch.Tensor, t_sigma: float) -> torch.Tensor:
+            batch_size = x_t.shape[0]
+            ts = torch.empty(batch_size, device=x_t.device, dtype=inner_timesteps.dtype)
+            ts.fill_(t_sigma * solver.scheduler.config.num_train_timesteps)
+            pred_v = solver.predict_vector(x_t, ts, p_emb, p_pool)
+            if n_emb is not None:
+                pred_null_v = solver.predict_vector(x_t, ts, n_emb, n_pool)
+                pred_v = pred_null_v + args.cfg_scale * (pred_v - pred_null_v)
+            return pred_v
+
+        tc_reg = TrajectoryConsistencyReg(
+            predict_velocity_fn=_predict_velocity,
+            num_samples=args.tc_num_samples,
+            t_range=(args.tc_t_min, args.tc_t_max),
+            stop_gradient_target=True,
+        )
 
         # ── 3. OPTIMIZATION LOOP WITH MOHE ────────────────────────────
         print(f"\n{'='*60}")
@@ -311,6 +523,16 @@ def run(args):
         # ═══════════════════════════════════════════════════════════════
         z0t_progress_images = []          # Euler sampled images
         latent_noise_progress_images = []  # Direct latent noise decoded
+        # latent_noise = nn.Parameter(torch.randn(1, 16, 96, 96, device='cuda'))
+        # optimizer_noise = torch.optim.Adam([latent_noise], lr=args.lr_noise_opt)
+        # scheduler = LambdaLR(optimizer_noise, lr_lambda)
+        z_init = torch.randn(1, 16, 96, 96, device=device)
+        cayley_param = LowRankCayleyLatent(z_init, rank=64).to(device)
+        optimizer_noise = torch.optim.Adam(
+            cayley_param.parameters(),  # U, V
+            lr=args.lr_noise_opt
+        )
+        scheduler = LambdaLR(optimizer_noise, lr_lambda)
 
         for opt_iter in range(args.noise_opt_steps):
             optimizer_noise.zero_grad()
@@ -319,12 +541,11 @@ def run(args):
             # MIXTURE OF EXPERTS OPTIMIZATION (USING EULER)
             # ══════════════════════════════════════════════════════════
             if args.use_amp:
-                # (a) Generate latent noise (outside autocast)
-                latent_noise = hh_param()
-                
                 # (b) EULER and DC loss in mixed precision
+                latent_noise = cayley_param.get_x_T()
+
                 with autocast(dtype=torch.float16):
-                    z0t_hat = solver.euler_sample_wo_process(
+                    z0t_hat = solver.euler_sample_wo_process_SDO(
                         initial_z=latent_noise,
                         timesteps=inner_timesteps, sigmas=inner_sigmas,
                         prompt_emb=p_emb, pooled_emb=p_pool,
@@ -332,7 +553,23 @@ def run(args):
                         cfg_scale=args.cfg_scale,
                     )
 
-                    loss_ir = solver.compute_data_consistency_loss_FAHG(
+                    # z0t_hat_test1 = solver.euler_sample_wo_process(
+                    #     initial_z=z0_test,
+                    #     timesteps=inner_timesteps, sigmas=inner_sigmas,
+                    #     prompt_emb=p_emb, pooled_emb=p_pool,
+                    #     null_emb=n_emb, null_pooled=n_pool,
+                    #     cfg_scale=args.cfg_scale,
+                    # )
+
+                    # z0t_hat_test2 = solver.euler_sample_wo_process(
+                    #     initial_z=z0_test2,
+                    #     timesteps=inner_timesteps, sigmas=inner_sigmas,
+                    #     prompt_emb=p_emb, pooled_emb=p_pool,
+                    #     null_emb=n_emb, null_pooled=n_pool,
+                    #     cfg_scale=args.cfg_scale,
+                    # )
+
+                    loss_ir = solver.compute_data_consistency_loss(
                         z0t=z0t_hat, A=A_funcs, y=y,
                         sigma_val=sigma_for_dc, noise_std=args.noise_std,
                         phi=args.phi, eta_tilde=args.eta_tilde,
@@ -340,22 +577,28 @@ def run(args):
                         # debug_save_path="./debug_freq_images"
                     )
 
+                    # TC Consistency Regularization (inside autocast for FP16 transformer)
+                    if args.lambda_tc_cons > 0.0:
+                        loss_tc_v = tc_reg(latent_noise, z0t_hat)
+                    else:
+                        loss_tc_v = torch.tensor(0.0, device=latent_noise.device)
+
                 # (c) Regularization losses in FP32
                 # MoHE regularization
-                loss_mohe_reg = hh_param.get_regularization_loss(
-                    lambda_orth=args.lambda_orth,
-                    lambda_scale=args.lambda_scale_reg,
-                    lambda_diversity=args.lambda_diversity
-                )
-                
+                # loss_mohe_reg = hh_param.get_regularization_loss(
+                #     lambda_orth=args.lambda_orth,
+                #     lambda_scale=args.lambda_scale_reg,
+                #     lambda_diversity=args.lambda_diversity
+                # )
+
                 # Gaussianity regularization
                 loss_jb_v = reg_jb(latent_noise)
                 loss_ks_v = reg_ks(latent_noise)
 
                 loss_total = (loss_ir
-                              + loss_mohe_reg
                               + args.lambda_jb * loss_jb_v
-                              + args.lambda_ks * loss_ks_v)
+                              + args.lambda_ks * loss_ks_v
+                              + args.lambda_tc_cons * loss_tc_v)
 
                 # Check for inf/nan before backward
                 if torch.isfinite(loss_total):
@@ -365,7 +608,7 @@ def run(args):
                     scaler.unscale_(optimizer_noise)
                     
                     # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(hh_param.parameters(), max_norm=1.0)
+                    torch.nn.utils.clip_grad_norm_(cayley_param.parameters(), max_norm=1.0)
                     
                     # Store scale before step
                     scale_before = scaler.get_scale()
@@ -373,7 +616,11 @@ def run(args):
                     scaler.step(optimizer_noise)
                     scaler.update()
                     scheduler.step()  # ← LR warmup
-                    
+
+                    # with torch.no_grad():
+                    #     cayley = LowRankCayleyLatent(latent_noise.data, rank=64).to(device)
+                    #     latent_noise.data = cayley.get_x_T()
+
                     # Check if step was skipped
                     scale_after = scaler.get_scale()
                     if opt_iter < 10 and scale_before != scale_after:
@@ -402,21 +649,20 @@ def run(args):
                     # debug_save_path="./debug_freq_images"
                 )
 
-                # MoHE regularization
-                loss_mohe_reg = hh_param.get_regularization_loss(
-                    lambda_orth=args.lambda_orth,
-                    lambda_scale=args.lambda_scale_reg,
-                    lambda_diversity=args.lambda_diversity
-                )
-                
+                # TC Consistency Regularization
+                if args.lambda_tc_cons > 0.0:
+                    loss_tc_v = tc_reg(latent_noise, z0t_hat)
+                else:
+                    loss_tc_v = torch.tensor(0.0, device=latent_noise.device)
+
                 # Gaussianity regularization
                 loss_jb_v = reg_jb(latent_noise)
                 loss_ks_v = reg_ks(latent_noise)
 
                 loss_total = (loss_ir
-                              + loss_mohe_reg
                               + args.lambda_jb * loss_jb_v
-                              + args.lambda_ks * loss_ks_v)
+                              + args.lambda_ks * loss_ks_v
+                              + args.lambda_tc_cons * loss_tc_v)
 
                 loss_total.backward()
 
@@ -465,16 +711,26 @@ def run(args):
 
                 print(f"  [opt {opt_iter:4d}/{args.noise_opt_steps}]  "
                       f"total={loss_total.item():.4f}  ir={loss_ir.item():.4f}  "
-                      f"mohe_reg={loss_mohe_reg.item():.2e}  jb={loss_jb_v.item():.2e}  ks={loss_ks_v.item():.2e}  "
+                      f"tc={loss_tc_v.item():.2e}  "
+                      f"jb={loss_jb_v.item():.2e}  ks={loss_ks_v.item():.2e}  "
                       f"JB:{jb_tag}(p={jb_pval:.4f})  KS:{ks_tag}(p={ks_pval:.4f})  "
                       f"Spatial:{spatial_tag}(corr={corr_max:.3f})  "
                       f"GPU:{allocated:.2f}/{reserved:.2f}GB")
-                
+
+                global_step = i * args.noise_opt_steps + opt_iter
+                mlflow.log_metrics({
+                    "loss_total": loss_total.item(),
+                    "loss_ir": loss_ir.item(),
+                    "loss_tc": loss_tc_v.item(),
+                    "loss_jb": loss_jb_v.item(),
+                    "loss_ks": loss_ks_v.item(),
+                }, step=global_step)
+
                 torch.cuda.empty_cache()
                 gc.collect()
 
             # Delete gradient tensors
-            del z0t_hat, loss_ir, loss_mohe_reg, loss_jb_v, loss_ks_v, loss_total, latent_noise
+            del z0t_hat, loss_ir, loss_tc_v, loss_jb_v, loss_ks_v, loss_total
 
         # ── Expert importance analysis ────────────────────────────────
         importance = hh_param.get_expert_importance()
@@ -519,7 +775,8 @@ def run(args):
         # Get optimized noise for final sampling
         # ══════════════════════════════════════════════════════════════
         with torch.no_grad():
-            optimized_noise = hh_param()
+           #  optimized_noise = hh_param()
+           optimized_noise = latent_noise
 
         # ══════════════════════════════════════════════════════════════
         # 4-1. Final Euler Sampling (Original method)
@@ -641,19 +898,37 @@ def run(args):
             save_image(recon_img_ps_01, args.workdir / 'recon_posterior' / f'{img_name}.png')
 
         # Save comparisons
+        comparison_path = args.workdir / 'recon_GT' / f'{img_name}_euler_comparison.png'
         save_comparison(
             y_vis_01, recon_img_euler_01, gt_img_01,
-            args.workdir / 'recon_GT' / f'{img_name}_euler_comparison.png',
+            comparison_path,
         )
-        print(f"  Saved: {args.workdir / 'recon_GT' / f'{img_name}_euler_comparison.png'}")
-        
+        print(f"  Saved: {comparison_path}")
+
         if args.use_posterior_sampling:
             # FIXED: All tensors now on same device (GPU)
+            ps_comparison_path = args.workdir / 'recon_GT' / f'{img_name}_posterior_comparison.png'
             save_comparison(
                 y_vis_01, recon_img_ps_01, gt_img_01,
-                args.workdir / 'recon_GT' / f'{img_name}_posterior_comparison.png',
+                ps_comparison_path,
             )
-            print(f"  Saved: {args.workdir / 'recon_GT' / f'{img_name}_posterior_comparison.png'}")
+            print(f"  Saved: {ps_comparison_path}")
+
+        # ── MLflow: log metrics and images ───────────────────────
+        mlflow.log_metrics({
+            f"{img_name}/psnr": metrics_euler['psnr'],
+            f"{img_name}/ssim": metrics_euler['ssim'],
+            f"{img_name}/lpips": metrics_euler['lpips'],
+        }, step=i)
+        if args.use_posterior_sampling:
+            mlflow.log_metrics({
+                f"{img_name}/psnr_ps": metrics_ps['psnr'],
+                f"{img_name}/ssim_ps": metrics_ps['ssim'],
+                f"{img_name}/lpips_ps": metrics_ps['lpips'],
+            }, step=i)
+        mlflow.log_artifact(str(comparison_path), artifact_path=f"images/{img_name}")
+        mlflow.log_artifact(str(args.workdir / 'recon_euler' / f'{img_name}.png'), artifact_path=f"images/{img_name}")
+        mlflow.log_artifact(str(args.workdir / 'input1' / f'{img_name}.png'), artifact_path=f"images/{img_name}")
 
         print(f"{'='*60}\n")
 
@@ -667,6 +942,8 @@ def run(args):
             del scaler
         torch.cuda.empty_cache()
         gc.collect()
+
+    mlflow.end_run()
 
 
 if __name__ == "__main__":
@@ -730,6 +1007,16 @@ if __name__ == "__main__":
                         help='Weight for Jarque-Bera regularization')
     parser.add_argument('--lambda_ks', type=float, default=1e-2,
                         help='Weight for KS quantile-matching regularization')
+
+    # Trajectory Consistency Regularization params
+    parser.add_argument('--lambda_tc_cons', type=float, default=0.0,
+                        help='Weight for trajectory consistency regularization (0 = disabled)')
+    parser.add_argument('--tc_num_samples', type=int, default=2,
+                        help='Number of t samples per optimization step for TC reg')
+    parser.add_argument('--tc_t_min', type=float, default=0.1,
+                        help='Minimum t (sigma) for TC regularization sampling')
+    parser.add_argument('--tc_t_max', type=float, default=0.9,
+                        help='Maximum t (sigma) for TC regularization sampling')
     
     # Data Consistency params
     parser.add_argument('--phi', type=float, default=1.0,
