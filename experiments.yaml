@@ -1,0 +1,77 @@
+# ============================================================
+# 실험 배치 설정 파일
+# 사용법: python run_experiments.py [--dry-run] [--only NAME] [--skip-existing]
+# ============================================================
+
+# 결과 저장 루트 폴더
+# null이면 오늘 날짜로 자동 생성: workdir_results_260314
+base_workdir_root: ~
+
+# 모든 실험에 공통 적용되는 기본값
+# experiments 각 항목의 overrides에서 덮어쓸 수 있음
+base_config:
+  img_path: ./data/FFHQ_5
+  img_size: 768
+  prompt: "a high quality photo of a face"
+  method: naive
+  operator_imp: FFT
+  deg_scale: 61
+  noise_std: 0.03
+  cfg_scale: 1.0
+  seed: 42
+  NFE: 28
+  n_experts: 8
+  n_reflections_per_expert: 4
+  noise_opt_steps: 50
+  lr_noise_opt: 0.001
+  lambda_jb: 0
+  lambda_ks: 0
+  lambda_orth: 0
+  # bool 플래그: true → --플래그명 추가, false → 생략
+  use_grad_checkpoint: true
+  use_amp: true
+  efficient_memory: true
+
+# 실험 목록
+# - name   : 실험 이름 (workdir 경로에 사용됨, 중복 불가)
+# - script : 실행할 스크립트 파일명
+# - task   : 역할(deblur_motion, sr_bicubic 등), workdir 경로 중간 단계에 사용
+# - overrides: base_config에서 바꿀 값만 지정
+#
+# workdir 자동 생성: {base_workdir_root}/{task}/{name}
+# 예: workdir_results_260314/deblur_motion/euler_deblur_motion
+#
+# 직접 경로를 지정하려면 overrides에 workdir 키를 추가:
+#   overrides:
+#     workdir: my/custom/output/path
+
+experiments:
+
+  - name: bk_deblur_motion
+    script: solve_ours_noise_opt_euler_bk.py
+    task: deblur_motion
+    overrides:
+      inner_NFE: 28
+      noise_opt_steps: 25
+
+  - name: sdo_deblur_motion
+    script: solve_ours_noise_opt_euler_sdo.py
+    task: deblur_motion
+    overrides:
+      inner_NFE: 5
+      noise_opt_steps: 50
+      use_sdo: true
+
+  - name: euler_deblur_motion
+    script: solve_ours_noise_opt_euler.py
+    task: deblur_motion
+    overrides:
+      inner_NFE: 5
+      noise_opt_steps: 50
+
+  - name: fireflow_deblur_motion
+    script: solve_ours_noise_opt_fireflow.py
+    task: deblur_motion
+    overrides:
+      inner_NFE: 3
+      noise_opt_steps: 50
